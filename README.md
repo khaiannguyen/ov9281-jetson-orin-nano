@@ -55,26 +55,25 @@ reference sensors at all.
 ## Architecture
 
 ```
-  Userspace (v4l2-ctl / OpenCV)
-          |
-  V4L2 device nodes: /dev/video0, /dev/video1
-          |
-  V4L2 Framework / tegracam v2.0 (kernel)
-          |
-    +-----+-----+
-    |           |
-nv_ov9281.c   NVCSI / VI
-(this port)   (nvidia-oot, unmodified)
-    |           |
-I2C / SCCB   CSI-2 PHY
-(i2c-mux-gpio,  (2-lane,
- cam_i2cmux)     per camera)
-    |           |
-    +-----+-----+
-          |
-   -------+-------
-   |             |
-OV9281 CAM0   OV9281 CAM1
+                 Userspace (v4l2-ctl / OpenCV)
+                              |
+            V4L2 device nodes: /dev/video0, /dev/video1
+                              |    
+              V4L2 Framework / tegracam v2.0 (kernel)
+                              |
+                +-------------+---------------+
+                |                             |
+            nv_ov9281.c                  NVCSI / VI
+            (this port)            (nvidia-oot, unmodified)
+                |                             |
+            I2C / SCCB                     CSI-2 PHY
+      (i2c-mux-gpio,cam_i2cmux)        (2-lane per camera)
+                |                             | 
+                +--------------+--------------+
+                               | 
+                ---------------+---------------
+                |                             |
+            OV9281 CAM0                  OV9281 CAM1
 ```
 
 **Data path**
