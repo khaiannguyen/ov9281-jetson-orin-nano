@@ -16,9 +16,22 @@ demosaicing artifacts affecting matching). This script:
      BG10 due to a platform-wide framework limitation with no monochrome
      format entry -- see README -- but the underlying byte data is correct
      monochrome data regardless of that label).
-  3. Computes a disparity map with OpenCV's StereoBM block matcher.
-  4. Saves a colorized disparity visualization plus the two rectified-ish
-     source frames.
+  3. Computes a disparity map with OpenCV's StereoSGBM (semi-global block
+     matching), which handles low-texture/low-contrast scenes considerably
+     better than the simpler StereoBM matcher.
+  4. Saves a colorized disparity visualization plus the two source frames.
+
+SCENE REQUIREMENTS FOR A USEFUL RESULT: block-matching stereo needs visual
+texture to find correspondences between the two views. A flat, dim, low-
+contrast scene (bare wall, dark desk) will produce a mostly-empty/noisy
+disparity map almost regardless of matcher quality -- this is expected
+behavior, not a bug. For a meaningful test shot: point the rig at a
+textured object (an open book, a patterned fabric, a keyboard) at roughly
+20-60cm range, in reasonably bright, even lighting. Bright point light
+sources (lamps, reflections) in an otherwise dark/flat scene tend to look
+identical in both views and are a common source of false-match artifacts
+(streaks/blobs of spurious high disparity) -- avoid framing them prominently
+if you want a clean result.
 
 CALIBRATION NOTE: this script produces a *qualitative* disparity map only.
 Turning disparity into real-world distance requires:
@@ -85,9 +98,36 @@ def load_mono16(path: Path, width: int, height: int) -> np.ndarray:
     return (data >> 8).astype(np.uint8)
 
 
+def equalize(img: np.ndarray) -> np.ndarray:
+    """CLAHE contrast enhancement -- helps SGBM find matches in dim scenes."""
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    return clahe.apply(img)
+
+
 def compute_disparity(left: np.ndarray, right: np.ndarray) -> np.ndarray:
-    stereo = cv2.StereoBM_create(numDisparities=16 * 6, blockSize=15)
-    disparity = stereo.compute(left, right)
+    """
+    StereoSGBM (semi-global block matching) -- noticeably more robust than
+    plain StereoBM on scenes with limited texture/contrast, at higher
+    compute cost (still fine for a single still-frame pair on Orin Nano).
+    """
+    block_size = 5
+    min_disp = 0
+    num_disp = 16 * 8  # must be divisible by 16
+
+    stereo = cv2.StereoSGBM_create(
+        minDisparity=min_disp,
+        numDisparities=num_disp,
+        blockSize=block_size,
+        P1=8 * 1 * block_size ** 2,
+        P2=32 * 1 * block_size ** 2,
+        disp12MaxDiff=1,
+        uniquenessRatio=10,
+        speckleWindowSize=100,
+        speckleRange=32,
+        mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY,
+    )
+    # StereoSGBM returns fixed-point disparity (16x subpixel); convert to float
+    disparity = stereo.compute(left, right).astype(np.float32) / 16.0
     return disparity
 
 
@@ -96,6 +136,11 @@ def main() -> int:
     ap.add_argument("--width", type=int, default=1280)
     ap.add_argument("--height", type=int, default=800)
     ap.add_argument("--out-dir", type=Path, default=Path("."))
+    ap.add_argument(
+        "--no-clahe",
+        action="store_true",
+        help="Disable CLAHE contrast enhancement before matching",
+    )
     args = ap.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -109,19 +154,44 @@ def main() -> int:
     cv2.imwrite(str(args.out_dir / "left.png"), left)
     cv2.imwrite(str(args.out_dir / "right.png"), right)
 
-    print("Computing disparity map...")
-    disparity = compute_disparity(left, right)
+    if not args.no_clahe:
+        left_m = equalize(left)
+        right_m = equalize(right)
+        cv2.imwrite(str(args.out_dir / "left_enhanced.png"), left_m)
+        cv2.imwrite(str(args.out_dir / "right_enhanced.png"), right_m)
+    else:
+        left_m, right_m = left, right
+
+    print("Computing disparity map (StereoSGBM)...")
+    disparity = compute_disparity(left_m, right_m)
+
+    # Mask out invalid/low-confidence disparities (StereoSGBM marks these
+    # with a large negative sentinel value) before normalizing for display.
+    valid = disparity > 0
+    disp_display = np.zeros_like(disparity)
+    disp_display[valid] = disparity[valid]
 
     disp_norm = cv2.normalize(
-        disparity, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX
+        disp_display, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX
     ).astype(np.uint8)
     disp_color = cv2.applyColorMap(disp_norm, cv2.COLORMAP_JET)
+    # Black out invalid pixels so they don't get colored as "far" by the map
+    disp_color[~valid] = (0, 0, 0)
     cv2.imwrite(str(args.out_dir / "disparity.png"), disp_color)
 
+    valid_pct = 100.0 * valid.sum() / valid.size
     print(
-        "Done. Wrote left.png, right.png, disparity.png to "
+        f"Done. Wrote left.png, right.png, disparity.png to "
         f"{args.out_dir.resolve()}"
     )
+    print(f"Valid disparity coverage: {valid_pct:.1f}% of pixels.")
+    if valid_pct < 5:
+        print(
+            "WARNING: very low coverage -- this usually means the scene has "
+            "too little texture/contrast for stereo matching. Point the "
+            "cameras at a textured object (book, patterned fabric, "
+            "keyboard) at ~20-60cm in even, bright lighting and try again."
+        )
     print(
         "Note: disparity is qualitative only -- see script docstring for "
         "what's needed to turn this into calibrated metric depth."
