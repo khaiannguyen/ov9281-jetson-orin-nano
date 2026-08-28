@@ -54,32 +54,27 @@ reference sensors at all.
 
 ## Architecture
 
-```mermaid
-flowchart TB
-    U["Userspace<br/>v4l2-ctl / OpenCV"]
-    V["V4L2 device nodes<br/>/dev/video0 · /dev/video1"]
-    T["V4L2 Framework / tegracam v2.0<br/>(kernel)"]
-
-    D["nv_ov9281.c<br/>(this port)"]
-    N["NVCSI / VI<br/>(nvidia-oot · unmodified)"]
-
-    M["I2C / SCCB<br/>via i2c-mux-gpio (cam_i2cmux)"]
-    P["CSI-2 PHY<br/>2-lane · per camera"]
-
-    C0["OV9281<br/>CAM0"]
-    C1["OV9281<br/>CAM1"]
-
-    U --> V --> T
-    T --> D
-    T --> N
-
-    D --> M
-    N --> P
-
-    M --> C0
-    M --> C1
-    P --> C0
-    P --> C1
+```
+  Userspace (v4l2-ctl / OpenCV)
+          |
+  V4L2 device nodes: /dev/video0, /dev/video1
+          |
+  V4L2 Framework / tegracam v2.0 (kernel)
+          |
+    +-----+-----+
+    |           |
+nv_ov9281.c   NVCSI / VI
+(this port)   (nvidia-oot, unmodified)
+    |           |
+I2C / SCCB   CSI-2 PHY
+(i2c-mux-gpio,  (2-lane,
+ cam_i2cmux)     per camera)
+    |           |
+    +-----+-----+
+          |
+   -------+-------
+   |             |
+OV9281 CAM0   OV9281 CAM1
 ```
 
 **Data path**
