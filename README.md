@@ -6,6 +6,7 @@ to the current tegracam v2.0 framework, and bringing up two OV9281 global
 shutter mono cameras simultaneously on a Jetson Orin Nano.
 
 ![Hardware setup](docs/hardware_setup.jpg)
+*Jetson Orin Nano with two Waveshare OV9281-120 modules connected to CAM0/CAM1.*
 
 ## TL;DR
 
@@ -27,6 +28,12 @@ shutter mono cameras simultaneously on a Jetson Orin Nano.
   See [Known Limitations](#known-limitations).
 - Includes a stereo depth-map demo built on the two synchronized mono feeds.
 
+**Want to port this to your own Jetson Orin Nano?** See
+[`INSTALL.md`](INSTALL.md) for a full step-by-step reproduction guide
+(downloading the right BSP sources, building the module, writing the boot
+overlay, and verifying capture) — written so someone else can follow it on
+their own board, not just as a record of what was done here.
+
 ## Why this driver needed porting at all
 
 NVIDIA's `Camera Driver Porting` documentation for R39.2 confirms a
@@ -47,32 +54,49 @@ reference sensors at all.
 
 ## Architecture
 
-```
-Userspace (v4l2-ctl / OpenCV)
-        │
-   /dev/video0, /dev/video1        ← V4L2 device nodes (tegra-capture-vi)
-        │
-┌───────┴──────────────────────────────────────┐
-│  V4L2 Framework / tegracam v2.0 (kernel)       │
-│                                                 │
-│  ┌──────────────┐      ┌──────────────────┐   │
-│  │ nv_ov9281.c   │      │ NVCSI / VI        │   │
-│  │ (this port)   │──────▶│ (nvidia-oot,      │   │
-│  │               │      │  unmodified)      │   │
-│  └──────────────┘      └──────────────────┘   │
-└─────────────────────────────────────────────────┘
-        │                              │
-     I2C (SCCB, via i2c-mux-gpio)   CSI-2 PHY (2-lane, per-camera)
-        │                              │
-┌───────▼────────┐            ┌────────▼────────┐
-│  OV9281 (cam0)  │            │  OV9281 (cam1)  │
-└─────────────────┘            └─────────────────┘
+```mermaid
+flowchart TB
+    U["Userspace<br/>v4l2-ctl / OpenCV"]
+    V["V4L2 device nodes<br/>/dev/video0 · /dev/video1"]
+    T["V4L2 Framework / tegracam v2.0<br/>(kernel)"]
+
+    D["nv_ov9281.c<br/>(this port)"]
+    N["NVCSI / VI<br/>(nvidia-oot · unmodified)"]
+
+    M["I2C / SCCB<br/>via i2c-mux-gpio (cam_i2cmux)"]
+    P["CSI-2 PHY<br/>2-lane · per camera"]
+
+    C0["OV9281<br/>CAM0"]
+    C1["OV9281<br/>CAM1"]
+
+    U --> V --> T
+    T --> D
+    T --> N
+
+    D --> M
+    N --> P
+
+    M --> C0
+    M --> C1
+    P --> C0
+    P --> C1
 ```
 
-I2C is a single physical controller multiplexed via `i2c-mux-gpio`
-(`cam_i2cmux`), not two independent buses — both sensors respond at the same
-7-bit address (`0x60`) on separate mux channels, which is safe because the
-mux driver serializes access at the kernel level.
+**Data path**
+
+- **Userspace → V4L2 → tegracam:** applications access the two camera streams through
+  `/dev/video0` and `/dev/video1`.
+- **tegracam → `nv_ov9281.c`:** the ported OV9281 sensor driver handles sensor
+  configuration, controls, power management, and streaming callbacks.
+- **`nv_ov9281.c` → I2C/SCCB → sensors:** sensor registers are accessed through the
+  single physical I2C controller and `i2c-mux-gpio`.
+- **tegracam → NVCSI/VI → CSI-2 PHY → sensors:** image data travels over the
+  2-lane MIPI CSI-2 links into the Jetson capture pipeline.
+
+> **Important:** I2C is a single physical controller multiplexed via
+> `i2c-mux-gpio` (`cam_i2cmux`), not two independent I2C buses. Both sensors use
+> the same 7-bit address (`0x60`) on separate mux channels, and the mux driver
+> serializes access at the kernel level.
 
 ## Porting summary
 
@@ -169,6 +193,23 @@ See [`ovti,ov9281.yaml`](ovti,ov9281.yaml) for the full binding
 documentation, written to match upstream Linux kernel DT-binding
 conventions.
 
+## Proof of capture
+
+Both cameras successfully capturing real monochrome frames, independently
+and simultaneously, over V4L2:
+
+| CAM0 | CAM1 |
+|---|---|
+| ![cam0 sample](docs/sample_capture_cam0.png) | ![cam1 sample](docs/sample_capture_cam1.png) |
+
+And a stereo disparity map computed from a synchronized pair (see
+[Stereo depth demo](#stereo-depth-demo) below — this particular sample was
+captured before calibration/rectification was added, and in low ambient
+light, so treat it as "the pipeline works end-to-end" evidence rather than
+"depth quality" evidence):
+
+![sample disparity map](docs/sample_disparity.png)
+
 ## Verifying capture
 
 ```bash
@@ -205,13 +246,33 @@ frames each, in parallel) with no I2C-mux contention or CSI dropouts.
 
 ## Stereo depth demo
 
-See [`demo/stereo_depth.py`](demo/stereo_depth.py). Captures a synchronized
-frame pair from both cameras via V4L2, computes a disparity map with
-OpenCV's block-matching stereo algorithm, and saves a colorized depth
-visualization. See the script's header comment for calibration notes —
-without a proper stereo calibration (baseline distance, focal length in
-pixels), the output is a qualitative disparity map, not calibrated metric
-depth.
+Two versions are included, in increasing order of quality:
+
+- [`demo/stereo_depth.py`](demo/stereo_depth.py) — quick, uncalibrated
+  disparity map from a single synchronized frame pair. No setup required
+  beyond the two cameras working.
+- [`demo/generate_checkerboard.py`](demo/generate_checkerboard.py) +
+  [`demo/calibrate_stereo.py`](demo/calibrate_stereo.py) +
+  [`demo/rectified_depth.py`](demo/rectified_depth.py) — a proper stereo
+  calibration workflow: print the generated checkerboard, capture ~15-20
+  calibration pairs, compute intrinsics/extrinsics/rectification maps
+  (`cv2.stereoCalibrate` + `cv2.stereoRectify`), then produce a rectified
+  disparity map with an estimated real-world distance (mm) at the image
+  center, using the calibrated baseline and focal length.
+
+**Status:** the calibration itself converges well (reprojection error under
+1px, computed baseline matching the physically measured ~41mm baseline
+within a few percent). The resulting *depth map quality* in the sample
+images above is still limited by ambient lighting and scene texture in this
+project's test environment (dim room, low-texture surfaces causing motion
+blur from the longer exposure needed) rather than by the calibration or
+matching code itself — see the script docstrings for what a good input scene
+looks like. Improving this further (brighter/more controlled lighting, a
+more textured test scene, possibly a subpixel-refined matcher) is a
+reasonable next step for anyone building on this repo, not a blocker for
+using the driver/device-tree port itself.
+
+See each script's header docstring for full usage and calibration notes.
 
 ## Sources
 
