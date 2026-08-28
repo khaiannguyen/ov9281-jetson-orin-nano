@@ -1,0 +1,127 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/i2c/ovti,ov9281.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: OmniVision OV9281 1/4" 1MP Monochrome Global Shutter CMOS Sensor
+
+maintainers:
+  - Jetson OV9281 port contributor <your-email-or-github-handle>
+
+description: |
+  The OmniVision OV9281 is a 1/4-inch 1-megapixel (1280x800) monochrome
+  CMOS image sensor with global shutter, supporting 8/10-bit RAW output over
+  a 2-lane MIPI CSI-2 interface. Register configuration and streaming are
+  controlled over an SCCB (I2C-compatible) bus.
+
+  This binding documents the properties used by the NVIDIA Jetson tegracam
+  v2.0 driver (nv_ov9281.c) as ported for kernel 6.8 / L4T R39.2, based on
+  the original NVIDIA driver shipped for kernel 5.10 / L4T R35.6.5.
+
+  Note: unlike NVIDIA's IMX219 reference sensor, this board (Jetson Orin
+  Nano P3768) does not expose per-sensor camera power rails or a software
+  controlled MCLK -- both the 1.8/2.8/1.2V camera rails and CAM0/1_MCLK are
+  fixed-on at the board level. Consequently this binding intentionally does
+  NOT declare avdd-reg / dvdd-reg / iovdd-reg / clocks / clock-names
+  properties, matching the pattern already used by the reference
+  rbpcv2_imx219 nodes on this platform.
+
+allOf:
+  - $ref: /schemas/media/video-interface-devices.yaml#
+
+properties:
+  compatible:
+    const: ovti,ov9281
+
+  reg:
+    description: I2C slave address. OV9281 defaults to 0x60 (7-bit) with
+      the SID pin pulled low; a second default (0x10) is available if SID
+      is strapped high, and the address is further reprogrammable via
+      register 0x302B. On boards using a single physical I2C bus per
+      sensor (i2c-mux-gpio, one channel per camera), 0x60 can safely be
+      reused on every channel since the mux guarantees only one sensor is
+      addressable at a time.
+    maxItems: 1
+
+  reset-gpios:
+    description: Connected to the sensor's XSHUTDOWN pin (active high in
+      this driver's convention -- gpio_set_value(reset_gpio, 1) enables the
+      sensor). Per the OV9281 datasheet, XSHUTDOWN low forces hardware
+      reset/power-down (internal pull-down present), XSHUTDOWN high enables
+      normal operation.
+    maxItems: 1
+
+  lane_polarity:
+    description: |
+      Per-lane D-PHY polarity bitmask for the CSI brick wired to this
+      sensor's physical connector slot. This is an electrical property of
+      the board's CSI trace routing (P/N swap), not of the sensor itself --
+      it must match whatever value the platform's own reference sensor
+      (e.g. rbpcv2_imx219) declares for the same physical slot.
+
+      NOTE: omitting this property on a slot that requires it will not
+      produce a probe-time error; instead it manifests as a silent
+      CSI/MIPI receive timeout ("request timed out") with no data ever
+      reaching the VI, since the sensor is transmitting correctly but the
+      SoC's D-PHY receiver decodes the polarity-inverted lanes as noise.
+
+  mirror:
+    type: boolean
+    description: Enable horizontal mirror (maps to OV9281 TIMING_FORMAT2
+      MIRROR bit).
+
+  flip:
+    type: boolean
+    description: Enable vertical flip (maps to OV9281 TIMING_FORMAT1 FLIP
+      bit).
+
+  nvidia,fsync-mode:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: |
+      Optional hardware frame-sync role for multi-camera synchronized
+      capture over the sensor's FSIN pin:
+        0 = disabled (default)
+        1 = master (this sensor drives FSIN)
+        2 = slave (this sensor receives FSIN from a master)
+      Not required for independent (non-synchronized) dual-camera capture.
+
+  port:
+    $ref: /schemas/graph.yaml#/properties/port
+    description: MIPI CSI-2 endpoint. See video-interface-devices.yaml for
+      the standard endpoint properties (data-lanes, remote-endpoint, etc).
+      OV9281 always uses a fixed 2-lane MIPI CSI-2 output at up to 800 Mbps
+      per lane; num_lanes/mipi_lane_polarity must be declared per the
+      platform's nvcsi/vi channel node conventions, not here.
+
+required:
+  - compatible
+  - reg
+  - reset-gpios
+  - port
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/tegra234-gpio.h>
+
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        camera-sensor@60 {
+            compatible = "ovti,ov9281";
+            reg = <0x60>;
+            reset-gpios = <&gpio TEGRA234_MAIN_GPIO(H, 6) GPIO_ACTIVE_HIGH>;
+            lane_polarity = "6";
+            mirror = "false";
+            flip = "false";
+
+            port {
+                ov9281_cam0_out: endpoint {
+                    remote-endpoint = <&csi_in_vi_0>;
+                };
+            };
+        };
+    };

@@ -1,0 +1,516 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * tegra234-camera-ov9281-dual.dtsi
+ *
+ * Device tree "nội dung sensor" cho 2x Waveshare OV9281-120 (cam0/cam1) trên
+ * Jetson Orin Nano, board P3768 22-pin CSI connector.
+ *
+ * NGUỒN THAM CHIẾU (đọc code thật, R39.2, ~/Downloads/public_sources_39.2):
+ *  - Khung sườn/cấu trúc node: hardware/nvidia/t23x/nv-public/overlay/
+ *    tegra234-camera-rbpcv2-imx219.dtsi (IMX219 dual, ĐANG CHẠY ỔN trên
+ *    chính board này — dùng làm nền theo đúng quyết định dự án).
+ *  - property sensor (avdd-reg/mclk_khz/pixel_t/...): đối chiếu thêm
+ *    tegra234-camera-e3331-a00.dtsi, tegra234-camera-imx274-dual.dtsi
+ *    (ví dụ dùng avdd-reg/dvdd-reg/iovdd-reg cho board KHÁC có PMIC riêng).
+ *  - Ý nghĩa từng property: comment gốc trong chính rbpcv2-imx219.dtsi
+ *    (đã đọc đầy đủ, không copy lại toàn bộ khối docstring ở đây cho gọn).
+ *
+ * QUYẾT ĐỊNH KIẾN TRÚC ĐÃ XÁC NHẬN VỚI NGƯỜI DÙNG (phiên viết Giai đoạn 3):
+ *  1. KHÔNG khai "mclk" property — trên board P3768 (đã grep toàn bộ cây
+ *     clock T234/BPMP của R39.2, không có clock nào tên "cam_mclk1"/
+ *     "cam_mclk2"), MCLK là oscillator cố định luôn bật ở tầng phần cứng.
+ *     nv_imx219.c thật (đang chạy tốt) cũng không được cấp "mclk" — chỉ gọi
+ *     devm_clk_get() khi DT có khai. ov9281_power_get() đã được sửa lại
+ *     (thêm guard if (pdata->mclk_name)) khớp đúng pattern này — xem
+ *     nv_ov9281_ported_partial.c.
+ *  2. KHÔNG khai avdd-reg/dvdd-reg/iovdd-reg — cùng lý do: board P3768
+ *     không có regulator riêng cho khe 22-pin (AVDD/DVDD/IOVDD cố định luôn
+ *     bật), IMX219 thật cũng không khai. ov9281_power_get()/power_on() vẫn
+ *     giữ nhánh `if (pw->avdd)` v.v. (vô hại, không chạy vì pw->avdd = NULL).
+ *  3. CÓ khai reset-gpios (XSHUTDOWN) — driver có request/toggle GPIO này
+ *     thật (ov9281_power_get/power_on đã port). GPIO cụ thể đặt ở file
+ *     overlay .dts (không phải .dtsi này), dùng lại đúng 2 chân
+ *     CAM0_PWDN/CAM1_PWDN mà IMX219 dual dùng — vì OV9281 module (Waveshare)
+ *     và IMX219 module (RPi V2) đều gắn qua CÙNG đầu nối 22-pin FPC vật lý
+ *     trên board này (chân này thuộc carrier board, không phụ thuộc sensor).
+ *     ✅ ĐÃ VERIFY THẬT (2026-08-28): dump device tree đang chạy thật qua
+ *     `/proc/device-tree`, giải mã property reset-gpios thật trên node
+ *     IMX219 đang chạy → khớp chính xác TEGRA234_MAIN_GPIO(H,6) (cam0) và
+ *     TEGRA234_MAIN_GPIO(AC,0) (cam1) — xem ghi chú đầy đủ trong
+ *     tegra234-p3767-camera-p3768-ov9281-dual.dts. Không còn là suy luận.
+ *  4. pixel_t = "RAW10" (không phải mono/Y10 thật) — sensor_common.c
+ *     (extract_pixel_format(), đã đọc code thật) chỉ hỗ trợ các chuỗi dạng
+ *     "bayer_...", "yuv_...", "RAW10", "RAW16", "rgb_..." — KHÔNG có entry
+ *     mono/Y10 nào. Giá trị
+ *     image->pixel_format suy ra từ đây chỉ dùng nội bộ cho test-pattern-
+ *     generator (csi.c:576, đã đọc code thật) — không ảnh hưởng mbus code
+ *     thật gửi cho userspace (mbus code thật lấy từ OV9281_DEFAULT_DATAFMT
+ *     = MEDIA_BUS_FMT_Y10_1X10 trong nv_ov9281_ported_partial.c, ĐÚNG mono).
+ *     Chọn "RAW10" vì đúng độ sâu bit (10-bit, không có bayer pattern nào áp
+ *     dụng cho ảnh mono nên nhãn "bayer" ẩn trong RAW10 vô hại ở đây).
+ *  5. discontinuous_clk = "no" — KHÁC IMX219 (dùng "yes"). Lý do: register
+ *     0x4800 (MIPI top control, bit 5 = discontinuous clk) trong CẢ 3 mode
+ *     table gốc OV9281 (ov9281_mode_tbls.h) đều ghi giá trị 0x00 → bit 5 = 0
+ *     → sensor cấu hình chạy continuous clock, không phải discontinuous.
+ *     Đây là dữ liệu thật lấy từ register table, không phải suy đoán.
+ *  6. num_lanes = "2" cố định cho cả 3 mode — datasheet mục "Format/
+ *     resolution hỗ trợ" (đã trích trong OV9281-Jetson-Project-Plan.md)
+ *     xác nhận mọi mode đều dùng 2-lane MIPI @ 800Mbps/lane.
+ *  7. physical_w/physical_h lấy từ datasheet mục "key specifications":
+ *     image area = 3896um x 2453um → 3.896mm x 2.453mm (số liệu chính thức
+ *     OmniVision công bố, không phải tự suy ra từ pixel_size x resolution).
+ *  8. pix_clk_hz = 80000000 cho cả 3 mode, line_length (HTS) = 728 cho cả 3
+ *     mode — đã tính và kiểm chứng ở Giai đoạn 2 (xem block ghi chú cuối
+ *     ov9281_mode_tbls.h): fps tính ra khớp khít ov9281_60fps[]/210fps[]
+ *     hiện có trong bảng frmfmt.
+ *  9. min/max_framerate, min/max_gain_val, exposure range: phần NÀO tính
+ *     được trực tiếp từ macro/công thức đã có trong nv_ov9281_ported_
+ *     partial.c (gain_factor=16 khớp OV9281_DEFAULT_GAIN, max_exp_time =
+ *     (VTS-25 dòng) x line_time — đúng công thức datasheet mục "maximum
+ *     exposure time: frame length - 25 row periods" đã trích) thì dùng số
+ *     THẬT. Phần chưa có dữ liệu cứng (ví dụ max_gain_val thực tế nên giới
+ *     hạn bao nhiêu trước khi nhiễu quá nhiều — datasheet không công bố
+ *     dynamic range/max gain cụ thể, ghi "TBD") dùng giá trị ước lượng an
+ *     toàn, có chú thích rõ "TODO: xác nhận khi bring-up thật" — không giả
+ *     vờ là số đã kiểm chứng.
+ */
+
+#include <dt-bindings/gpio/tegra234-gpio.h>
+
+/ {
+	fragment-camera@0 {
+		target-path = "/";
+		__overlay__ {
+			tegra-capture-vi  {
+				num-channels = <2>;
+				ports {
+					#address-cells = <1>;
+					#size-cells = <0>;
+					vi_port0: port@0 {
+						reg = <0>;
+						ov9281_vi_in0: endpoint {
+							port-index = <1>;
+							bus-width = <2>;
+							remote-endpoint = <&ov9281_csi_out0>;
+						};
+					};
+					vi_port1: port@1 {
+						reg = <1>;
+						ov9281_vi_in1: endpoint {
+							port-index = <2>;
+							bus-width = <2>;
+							remote-endpoint = <&ov9281_csi_out1>;
+						};
+					};
+				};
+			};
+
+			bus@0 {
+				host1x@13e00000 {
+					nvcsi@15a00000 {
+						num-channels = <2>;
+						#address-cells = <1>;
+						#size-cells = <0>;
+						csi_chan0: channel@0 {
+							reg = <0>;
+							ports {
+								#address-cells = <1>;
+								#size-cells = <0>;
+								csi_chan0_port0: port@0 {
+									reg = <0>;
+									ov9281_csi_in0: endpoint@0 {
+										port-index = <1>;
+										bus-width = <2>;
+										remote-endpoint = <&ov9281_out0>;
+									};
+								};
+								csi_chan0_port1: port@1 {
+									reg = <1>;
+									ov9281_csi_out0: endpoint@1 {
+										remote-endpoint = <&ov9281_vi_in0>;
+									};
+								};
+							};
+						};
+						csi_chan1: channel@1 {
+							reg = <1>;
+							ports {
+								#address-cells = <1>;
+								#size-cells = <0>;
+								csi_chan1_port0: port@0 {
+									reg = <0>;
+									ov9281_csi_in1: endpoint@2 {
+										port-index = <2>;
+										bus-width = <2>;
+										remote-endpoint = <&ov9281_out1>;
+									};
+								};
+								csi_chan1_port1: port@1 {
+									reg = <1>;
+									ov9281_csi_out1: endpoint@3 {
+										remote-endpoint = <&ov9281_vi_in1>;
+									};
+								};
+							};
+						};
+					};
+				};
+
+				cam_i2cmux {
+					i2c_0: i2c@0 {
+						ov9281_cam0: ov9281_a@60 {
+							compatible = "ovti,ov9281";
+							/* I2C 7-bit address mặc định (SID->GND), xem
+							 * OV9281_DEFAULT_I2C_ADDRESS_C0 trong .c */
+							reg = <0x60>;
+							devnode = "video0";
+							/* datasheet "key specifications": image area
+							 * 3896um x 2453um */
+							physical_w = "3.896";
+							physical_h = "2.453";
+							sensor_model = "ov9281";
+							use_sensor_mode_id = "true";
+
+							/* KHÔNG khai clocks/clock-names/mclk (đảo ngược quyết
+							 * định "extperiph1" trước đây — xem
+							 * tegra234-camera-ov9281-dual.dtsi.bak-before-clockfix-*
+							 * để xem bản cũ). Lý do đảo: bản cũ thêm "mclk" =
+							 * "extperiph1"/"extperiph2" chỉ để né lỗi PHẦN MỀM
+							 * -ENODATA trong camera_common_parse_clocks() (đã sửa
+							 * đúng ở đó), nhưng KHÔNG có bằng chứng extperiph1/2
+							 * thật sự lái chân CAM0/1_MCLK vật lý trên P3768 —
+							 * rbpcv2-imx219.dtsi thật (module IMX219 đang chạy tốt,
+							 * CÙNG 2 chân 22-pin FPC vật lý) không khai clocks/
+							 * clock-names/mclk gì cả (grep xác nhận, không chỉ
+							 * mclk_name=NULL phía code). Sau khi bỏ
+							 * mclk_disable()/power_off() khỏi nhánh thành công của
+							 * ov9281_board_setup() (fix trước) mà lỗi EREMOTEIO ở
+							 * 0x3208/0x3508 KHÔNG đổi — bằng chứng enable/disable
+							 * extperiph1/2 không hề ảnh hưởng gì tới sensor thật,
+							 * tức đây là clock SAI MỤC TIÊU, không phải MCLK vật lý.
+							 * Coi MCLK là oscillator cố định luôn bật (giống IMX219)
+							 * — không khai gì ở đây nữa. Để không tái phát lỗi
+							 * -ENODATA gốc, đã bỏ luôn lệnh gọi
+							 * camera_common_parse_clocks() trong ov9281_parse_dt()
+							 * (nv_ov9281.c) — khớp đúng cách imx219_parse_dt() làm
+							 * (không gọi hàm đó luôn, không chỉ là DT rỗng). */
+
+							mode0 { /* OV9281_MODE_1280X800 */
+								mclk_khz = "24000";
+								num_lanes = "2";
+								tegra_sinterface = "serial_b";
+								lane_polarity = "6";
+								phy_mode = "DPHY";
+								discontinuous_clk = "no";
+								dpcm_enable = "false";
+								cil_settletime = "0";
+								active_w = "1280";
+								active_h = "800";
+								pixel_t = "RAW10";
+								csi_pixel_bit_depth = "10";
+								readout_orientation = "0";
+								line_length = "728";
+								inherent_gain = "1";
+								mclk_multiplier = "3.33";
+								pix_clk_hz = "80000000";
+
+								gain_factor = "16";
+								min_gain_val = "16";     /* 1.00x */
+								max_gain_val = "256";    /* TODO: xác nhận thật, tạm 16.0x an toàn */
+								step_gain_val = "1";
+								default_gain = "16";     /* khớp OV9281_DEFAULT_GAIN=0x0010 */
+								min_hdr_ratio = "1";
+								max_hdr_ratio = "1";
+
+								framerate_factor = "1000000";
+								min_framerate = "2000000";   /* 2.0 fps */
+								max_framerate = "60000000";  /* 60.0 fps, khớp ov9281_60fps[] đã kiểm chứng */
+								step_framerate = "1";
+								default_framerate = "60000000";
+
+								exposure_factor = "1000000";
+								min_exp_time = "9";       /* 1 row period ~= line_length/pix_clk_hz */
+								max_exp_time = "16334";   /* (VTS 1820 - 25) x line_time, theo datasheet 2.5.2 */
+								step_exp_time = "1";
+								default_exp_time = "10000"; /* TODO: tinh chỉnh khi bring-up thật */
+								embedded_metadata_height = "0";
+							};
+
+							mode1 { /* OV9281_MODE_1280X720 */
+								mclk_khz = "24000";
+								num_lanes = "2";
+								tegra_sinterface = "serial_b";
+								lane_polarity = "6";
+								phy_mode = "DPHY";
+								discontinuous_clk = "no";
+								dpcm_enable = "false";
+								cil_settletime = "0";
+								active_w = "1280";
+								active_h = "720";
+								pixel_t = "RAW10";
+								csi_pixel_bit_depth = "10";
+								readout_orientation = "0";
+								line_length = "728";
+								inherent_gain = "1";
+								mclk_multiplier = "3.33";
+								pix_clk_hz = "80000000";
+
+								gain_factor = "16";
+								min_gain_val = "16";
+								max_gain_val = "256";
+								step_gain_val = "1";
+								default_gain = "16";
+								min_hdr_ratio = "1";
+								max_hdr_ratio = "1";
+
+								framerate_factor = "1000000";
+								min_framerate = "2000000";
+								max_framerate = "60000000";
+								step_framerate = "1";
+								default_framerate = "60000000";
+
+								exposure_factor = "1000000";
+								min_exp_time = "9";
+								max_exp_time = "16334";  /* VTS mode1 cũng = 1820, xem ov9281_mode_tbls.h */
+								step_exp_time = "1";
+								default_exp_time = "10000";
+								embedded_metadata_height = "0";
+							};
+
+							mode2 { /* OV9281_MODE_640X400 */
+								mclk_khz = "24000";
+								num_lanes = "2";
+								tegra_sinterface = "serial_b";
+								lane_polarity = "6";
+								phy_mode = "DPHY";
+								discontinuous_clk = "no";
+								dpcm_enable = "false";
+								cil_settletime = "0";
+								active_w = "640";
+								active_h = "400";
+								pixel_t = "RAW10";
+								csi_pixel_bit_depth = "10";
+								readout_orientation = "0";
+								line_length = "728";
+								inherent_gain = "1";
+								mclk_multiplier = "3.33";
+								pix_clk_hz = "80000000";
+
+								gain_factor = "16";
+								min_gain_val = "16";
+								max_gain_val = "256";
+								step_gain_val = "1";
+								default_gain = "16";
+								min_hdr_ratio = "1";
+								max_hdr_ratio = "1";
+
+								framerate_factor = "1000000";
+								min_framerate = "2000000";
+								/* 210fps: BUG THẬT trong ov9281_mode_tbls.h gốc NVIDIA đã
+								 * sửa (xem ghi chú "ov9281_210fps[]" trong file .h) — VTS=520
+								 * cho ra fps thật ~211.3, dùng 210 theo datasheet công bố. */
+								max_framerate = "210000000";
+								step_framerate = "1";
+								default_framerate = "210000000";
+
+								exposure_factor = "1000000";
+								min_exp_time = "9";
+								max_exp_time = "4504";  /* (VTS 520 - 25) x line_time */
+								step_exp_time = "1";
+								default_exp_time = "2000";
+								embedded_metadata_height = "0";
+							};
+
+							ports {
+								#address-cells = <1>;
+								#size-cells = <0>;
+								port@0 {
+									reg = <0>;
+									ov9281_out0: endpoint {
+										port-index = <1>;
+										bus-width = <2>;
+										remote-endpoint = <&ov9281_csi_in0>;
+									};
+								};
+							};
+						};
+					};
+
+					i2c_1: i2c@1 {
+						ov9281_cam1: ov9281_c@60 {
+							compatible = "ovti,ov9281";
+							reg = <0x60>;
+							devnode = "video1";
+							physical_w = "3.896";
+							physical_h = "2.453";
+							sensor_model = "ov9281";
+							use_sensor_mode_id = "true";
+
+							/* KHÔNG khai clocks/clock-names/mclk — lý do đầy đủ
+							 * xem comment tại ov9281_a@60 ở trên. */
+
+							mode0 {
+								mclk_khz = "24000";
+								num_lanes = "2";
+								tegra_sinterface = "serial_c";
+								phy_mode = "DPHY";
+								discontinuous_clk = "no";
+								dpcm_enable = "false";
+								cil_settletime = "0";
+								active_w = "1280";
+								active_h = "800";
+								pixel_t = "RAW10";
+								csi_pixel_bit_depth = "10";
+								readout_orientation = "0";
+								line_length = "728";
+								inherent_gain = "1";
+								mclk_multiplier = "3.33";
+								pix_clk_hz = "80000000";
+
+								gain_factor = "16";
+								min_gain_val = "16";
+								max_gain_val = "256";
+								step_gain_val = "1";
+								default_gain = "16";
+								min_hdr_ratio = "1";
+								max_hdr_ratio = "1";
+
+								framerate_factor = "1000000";
+								min_framerate = "2000000";
+								max_framerate = "60000000";
+								step_framerate = "1";
+								default_framerate = "60000000";
+
+								exposure_factor = "1000000";
+								min_exp_time = "9";
+								max_exp_time = "16334";
+								step_exp_time = "1";
+								default_exp_time = "10000";
+								embedded_metadata_height = "0";
+							};
+
+							mode1 {
+								mclk_khz = "24000";
+								num_lanes = "2";
+								tegra_sinterface = "serial_c";
+								phy_mode = "DPHY";
+								discontinuous_clk = "no";
+								dpcm_enable = "false";
+								cil_settletime = "0";
+								active_w = "1280";
+								active_h = "720";
+								pixel_t = "RAW10";
+								csi_pixel_bit_depth = "10";
+								readout_orientation = "0";
+								line_length = "728";
+								inherent_gain = "1";
+								mclk_multiplier = "3.33";
+								pix_clk_hz = "80000000";
+
+								gain_factor = "16";
+								min_gain_val = "16";
+								max_gain_val = "256";
+								step_gain_val = "1";
+								default_gain = "16";
+								min_hdr_ratio = "1";
+								max_hdr_ratio = "1";
+
+								framerate_factor = "1000000";
+								min_framerate = "2000000";
+								max_framerate = "60000000";
+								step_framerate = "1";
+								default_framerate = "60000000";
+
+								exposure_factor = "1000000";
+								min_exp_time = "9";
+								max_exp_time = "16334";
+								step_exp_time = "1";
+								default_exp_time = "10000";
+								embedded_metadata_height = "0";
+							};
+
+							mode2 {
+								mclk_khz = "24000";
+								num_lanes = "2";
+								tegra_sinterface = "serial_c";
+								phy_mode = "DPHY";
+								discontinuous_clk = "no";
+								dpcm_enable = "false";
+								cil_settletime = "0";
+								active_w = "640";
+								active_h = "400";
+								pixel_t = "RAW10";
+								csi_pixel_bit_depth = "10";
+								readout_orientation = "0";
+								line_length = "728";
+								inherent_gain = "1";
+								mclk_multiplier = "3.33";
+								pix_clk_hz = "80000000";
+
+								gain_factor = "16";
+								min_gain_val = "16";
+								max_gain_val = "256";
+								step_gain_val = "1";
+								default_gain = "16";
+								min_hdr_ratio = "1";
+								max_hdr_ratio = "1";
+
+								framerate_factor = "1000000";
+								min_framerate = "2000000";
+								max_framerate = "210000000";
+								step_framerate = "1";
+								default_framerate = "210000000";
+
+								exposure_factor = "1000000";
+								min_exp_time = "9";
+								max_exp_time = "4504";
+								step_exp_time = "1";
+								default_exp_time = "2000";
+								embedded_metadata_height = "0";
+							};
+
+							ports {
+								#address-cells = <1>;
+								#size-cells = <0>;
+								port@0 {
+									reg = <0>;
+									ov9281_out1: endpoint {
+										port-index = <2>;
+										bus-width = <2>;
+										remote-endpoint = <&ov9281_csi_in1>;
+									};
+								};
+							};
+						};
+					};
+				};
+			};
+
+			tegra-camera-platform {
+				compatible = "nvidia, tegra-camera-platform";
+				modules {
+					module0 {
+						badge = "waveshare_front_OV9281";
+						position = "front";
+						orientation = "1";
+						drivernode0 {
+							pcl_id = "v4l2_sensor";
+							sysfs-device-tree =
+							"/sys/firmware/devicetree/base/bus@0/cam_i2cmux/i2c@0/ov9281_a@60";
+						};
+					};
+					module1 {
+						badge = "waveshare_rear_OV9281";
+						position = "rear";
+						orientation = "1";
+						drivernode0 {
+							pcl_id = "v4l2_sensor";
+							sysfs-device-tree =
+							"/sys/firmware/devicetree/base/bus@0/cam_i2cmux/i2c@1/ov9281_c@60";
+						};
+					};
+				};
+			};
+		};
+	};
+};
